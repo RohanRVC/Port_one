@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: recon
+      POSTGRES_PASSWORD: recon
+      POSTGRES_DB: amazon_recon
+    ports:
+      - "5455:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recon -d amazon_recon"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://recon:recon@postgres:5432/amazon_recon?sslmode=disable
+    volumes:
+      - ./data:/app/data:ro
+      - ./output:/app/output
+      - ./migrations:/app/migrations:ro
+    command: ["all"]
+
+volumes:
+  pgdata:

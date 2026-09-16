@@ -1,0 +1,11 @@
+# Go
+/reconcile
+*.exe
+*.test
+
+# local scratch
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
