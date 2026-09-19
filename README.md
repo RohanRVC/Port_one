@@ -1,11 +1,25 @@
 # Amazon Payments vs Settlement Reconciliation
 
+**PortOne SDE II assignment submission** (Amazon Payments vs Settlement
+reconciliation).
+
 A Go + PostgreSQL pipeline that ingests Amazon's Payments and Settlement
 reports, applies config-driven mapping rules to build a shared
 reconciliation key, matches the two sources against each other, and
 produces an accounting-grade Excel report — plus a from-scratch
 investigation of the mapping defects planted in the given configs (see
 `PROGRESS.md` and `MAPPING_FIXES.sql`).
+
+## Submission checklist
+
+| Item asked for | Where it is |
+|---|---|
+| Source code with a README covering run steps, the schema and why, and assumptions | this repository; see "Steps to run the full flow end to end", "Schema — what I went with and why" and "Assumptions" below |
+| `MAPPING_FIXES.sql` (one commented block per defect, including the ones not fixable in config) | [`MAPPING_FIXES.sql`](MAPPING_FIXES.sql) |
+| Generated Excel report, before and after the fixes | [`output/before_fix/report.xlsx`](output/before_fix/report.xlsx), [`output/after_fix/report.xlsx`](output/after_fix/report.xlsx) |
+| PostgreSQL dump or representative sample after ingestion | [`dbdump/`](dbdump/) |
+| Progress log (what was tried, ruled out, how each variance was isolated) | [`PROGRESS.md`](PROGRESS.md) |
+| Number of reconciled / unreconciled-payment / unreconciled-settlement records | 13,289 / 9,377 / 0 (after fixes) — see "TL;DR results" |
 
 ## TL;DR results
 
