@@ -9,29 +9,41 @@ investigation of the mapping defects planted in the given configs (see
 
 ## TL;DR results
 
-- **149 → 144** payment mapping config rows after fixes (5 dead/duplicate
-  rows removed), **137** settlement config rows (content fixed, none
-  removed).
-- **12 applied config fixes** + **3 documented, not-fixable-in-config
-  defects** — see `MAPPING_FIXES.sql`.
+- **13,289 reconciled**, **9,377 unreconciled-payment**, **0
+  unreconciled-settlement** record_refs (after fixes; before fixes it was
+  13,289 / 9,379 / 0 — the two extra unreconciled ones were the Transfer
+  rows, see below).
+- **Tie-out to Amazon's own number.** The settlement file declares a total
+  of **212,118.95** for settlement 12395580393. The Settlements column of
+  the Summary sheet (Sales + Refunds + Expenses) adds up to exactly that,
+  and after the fixes the Payments side of the 13,289 reconciled
+  `record_ref`s also adds up to exactly **212,118.95** — every one of those
+  13,289 ties to the cent (0 with a nonzero difference).
+- **13 applied config fixes** plus 3 defects documented as not fixable in
+  config (and 1 open question) — see `MAPPING_FIXES.sql`. Payment config
+  went from 149 to 144 rows (5 dead/duplicate rows removed); settlement
+  config stays at 137 rows.
 - Biggest single fix: a mis-keyed `TRANSFER` rule was dumping **$231,676.27**
   of unrelated bank-transfer money into the "Amazon fees" Summary line.
-  Second-biggest: **$11,273.53** of promotional rebates mis-bucketed as
-  generic "Other" instead of "Promo rebates". A third defect made **all**
-  gift-wrap-credit money invisible on the Summary sheet entirely (routed to
-  a bucket the report template has no line for).
-- After fixes: 0 config-matching ambiguities (was 2, together firing on
-  45,566 rows), and the two reconciled-side Summary lines that previously
-  disagreed by $231k/$11k/$12/$0.36 now agree to the cent, cross-checked
-  three independent ways. The remaining Payments-vs-Settlements gap on
-  every Summary line is fully attributable to one thing: **this settlement
-  file covers only one settlement period, and the Payments file spans a
-  wider date range that includes orders belonging to other settlement
-  periods we were not given** — confirmed directly (see PROGRESS.md), not
-  assumed.
-- **13,289 reconciled**, **9,377 unreconciled-payment**, **0
-  unreconciled-settlement** record_refs (after fixes; see PROGRESS.md for
-  the before-fix counts and why they barely move).
+  Then **$11,273.53** of promotional rebates bucketed as generic "Other"
+  instead of "Promo rebates"; **$42.59** of tax on refunds that never
+  reached the Refunds section; and gift-wrap-credit money that was
+  invisible on the Summary sheet entirely (routed to a bucket the template
+  has no line for).
+- Two duplicate config keys that made matching ambiguous on 45,566 rows are
+  gone (0 ambiguities after the fixes).
+- What is still different between the Payments and Settlements columns of
+  the Summary sheet is fully accounted for, in two parts. **(1)** The 9,377
+  payment-only `record_ref`s (169,766.47) have exactly two causes, checked
+  across all of them, not a sample: **6,876** (123,953.39) are *Released*
+  transactions belonging to three other settlements (12370691583,
+  12382593803, 12407469483) that are not in the settlement file, and
+  **2,501** (45,813.08) are *Deferred* transactions with no release date,
+  i.e. not yet released to any settlement. **(2)** On the reconciled
+  records, three Sales lines differ by +103.78 / −103.42 / −0.36 (net
+  **0.00**) because the Payments report has one combined tax column where
+  the Settlement report splits the same tax across three buckets — the
+  money agrees to the cent, only the bucket differs (see "Known gaps").
 
 ## Repository layout
 
@@ -69,8 +81,7 @@ docker compose build app
 docker compose run --rm app all --out output/before_fix/report.xlsx
 
 # 4. apply the mapping fixes directly to the config tables
-docker compose run --rm postgres_client   # see note below, or:
-cat MAPPING_FIXES.sql | docker exec -i $(docker compose ps -q postgres) \
+cat MAPPING_FIXES.sql | docker compose exec -T postgres \
   psql -U recon -d amazon_recon -v ON_ERROR_STOP=1
 
 # 5. re-ingest (idempotent: truncates and rebuilds raw_records/summary/reconciliation
@@ -80,12 +91,18 @@ docker compose run --rm app ingest-data
 docker compose run --rm app report --out output/after_fix/report.xlsx
 ```
 
-There's no `postgres_client` service in `docker-compose.yml` — step 4's
-`cat ... | docker exec -i ...` line is the actual command to run; the
-placeholder line above it is just a reminder that MAPPING_FIXES.sql is
-applied via `psql`, not through the Go CLI (on purpose — it's meant to be
-reviewed as plain SQL against the config tables, not baked into the
-program).
+`MAPPING_FIXES.sql` is applied with plain `psql` rather than through the Go
+CLI on purpose: it's meant to be reviewed as ordinary SQL against the config
+tables, not baked into the program. If you re-run step 3 (or `load-configs`)
+after step 4, the config tables are reloaded from the original CSVs and the
+fixes are gone; re-apply step 4 to get them back.
+
+Step 3 takes one to four minutes depending on the machine (the ingest is
+the slow part) and the rest a few seconds to a minute each; there is no
+interactive input anywhere in the flow.
+
+Unit tests (no database needed): `go test ./...` if Go is installed, or
+`docker run --rm -v "$PWD":/src -w /src golang:1.23-bookworm go test ./...`.
 
 Individual subcommands (all accept `DATABASE_URL` from the environment,
 already set by `docker-compose.yml` for the `app` service):
@@ -383,8 +400,10 @@ every column the brief lists by name: `record_ref`, `status`, `source`
 (payment+settlement / payment only / settlement only), both sides'
 `transaction_type`/`description`/`amount_field`/`amount_type`/
 `amount_description`/`summary_field`, `sku`, `order_id`, `settlement_id`,
-`date`, `payment_amount`, `settlement_amount`, `difference`, and both
-sides' contributing row counts. Every value is a live join against
+`date`, `payment_amount`, `settlement_amount`, `difference`, both sides'
+contributing row counts, and the payment side's `transaction_status`
+(Released/Deferred — this is what explains most payment-only rows at a
+glance). Every value is a live join against
 `raw_records`/`reconciliation_results` — nothing is precomputed or
 hand-entered.
 
@@ -401,14 +420,13 @@ hand-entered.
   see "What counts toward reconciliation".
 - **Reconciliation happens at `record_ref` granularity**, per the
   assignment's own wording ("Match records ... on the shared record_ref") —
-  not at the finer (`record_ref`, `summary_field`) granularity. In the rare
-  case where a `record_ref` has payment-side money in one bucket and
-  settlement-side money in a *different* bucket, it still counts as
-  "reconciled" at the record_ref level even though no single bucket
-  actually agrees between the sides. We didn't find this occurring in
-  practice in this dataset (every bucket-level reconciled/unreconciled
-  breakdown we ran matched the record_ref-level breakdown exactly — see
-  PROGRESS.md), but it's a real interpretation choice worth stating.
+  not at the finer (`record_ref`, `summary_field`) granularity. A
+  `record_ref` whose payment-side money sits in one bucket and whose
+  settlement-side money sits in a different one still counts as reconciled
+  if the sums agree. This does happen here: it's exactly the tax case under
+  "Known gaps" (all 13,289 reconciled refs tie to the cent, yet three
+  Sales lines still differ by +103.78 / −103.42 / −0.36 because the same
+  tax money is bucketed differently on the two sides).
 - **A thousands separator (`,`) in an amount field is stripped, not
   treated as malformed input** — two real `Transfer` rows in the payments
   file are formatted `"-97,919.76"` while every other row in the file uses
@@ -416,6 +434,34 @@ hand-entered.
 - **Money is parsed and stored as exact cents (int64) internally**, never
   as a float, specifically to avoid the "silent rounding error" the
   assignment brief opens with — see `internal/ingest/money.go`.
+
+## How the numbers were checked
+
+Beyond the unit tests, the results were checked against things that don't
+depend on this pipeline:
+
+- **Amazon's own total.** The settlement TSV declares `total-amount`
+  212,118.95 for its one settlement; the sum of every `amount` line in the
+  same file is 212,118.95, and so is the Settlements column of the Summary
+  sheet (Sales + Refunds + Expenses).
+- **The `total` column is a checksum.** In the payments CSV, `total` equals
+  the sum of the other ten amount columns on all 23,026 rows (0
+  exceptions). That's why it's never summarized on top of its components.
+- **Every payments dollar is accounted for.** Payments `total` summed over
+  the file is 150,209.15; that equals the Summary's Payments net
+  (381,885.42) minus the 231,676.27 of bank `Transfer` rows, which are
+  deliberately not summarized. Every other transaction type
+  (Order, Adjustment, Refund, Service fee, FBA fees) is 100% routed.
+- **No money falls through the config.** The 831 components that matched no
+  config rule at all (830 payment, 1 settlement) are all exactly zero.
+- **An independent re-implementation.** A separate script that reads the raw
+  files and the fixed config directly (own matching, own date and
+  `record_ref` logic, no database) reproduces all 19 Summary buckets
+  (positive, negative and row counts) and all 22,666 `record_ref` results
+  (both amounts and status) with zero mismatches.
+- **A fresh clone runs.** The steps above were run from a clean clone of
+  the repository against an empty database; the regenerated reports match
+  the committed ones cell for cell.
 
 ## Known gaps / things we did not force a fix for
 
@@ -431,27 +477,39 @@ Documented in detail, with dollar impact where measurable, in
 2. `PROMOTION_FEE` has a settlement-side rule but no payment-side
    equivalent (same root cause: no `merchant_order_id` column in the
    Payments CSV). Zero impact in this run.
-3. A small (~$103 gross, ~$0.36 net) residual between the "Product
-   Charges" and "Shipping" Summary lines, even after fixing the two
-   duplicate-key config defects, because the Payments report gives one
-   combined tax/low-value-goods figure per order where the Settlement
-   report sometimes splits the same tax into a product-price portion and a
-   shipping portion — not expressible in the current config schema (a flat
-   one-bucket-per-rule mapping, no proportional/conditional split).
+3. **Tax bucketing on the Sales lines (net $0.00).** On the reconciled
+   records, Product Charges differs by +103.78, Shipping by −103.42 and
+   Other by −0.36. We traced it to the component level: the Payments
+   report's single `sales tax collected` column (13,675.59) equals, to the
+   cent, the settlement's Tax (13,765.71) + ShippingTax (581.68) +
+   Promotion/TaxDiscount (−672.16) + GiftWrapTax (0.36), which the
+   settlement config deliberately buckets into Product Charges, Shipping
+   and Other respectively. The money agrees; only the bucket differs, and
+   the Sales subtotal ties exactly. A flat (transaction_type, description,
+   amount_field) → bucket rule can't split one payments column across
+   three buckets. We could have forced the lines to match by re-bucketing
+   the settlement side's tax lines into Product Charges, but that would
+   override a deliberate classification purely to make a number agree, so
+   we left it and documented it (`MAPPING_FIXES.sql`, FIX 5).
 
 ## Bonus: error handling, idempotency, performance
 
 - **Idempotent re-ingestion**: `ingest-data` truncates and rebuilds
   `raw_records`/`summary_totals`/`config_match_ambiguities`/
-  `reconciliation_results` from scratch every run; running it twice in a
-  row produces byte-identical results. `migrate` and `load-configs` are
-  independently idempotent/safe to re-run.
+  `reconciliation_results` from scratch every run. Checked by hashing all
+  three derived tables (308,266 `raw_records` rows, `summary_totals`,
+  `reconciliation_results`) before and after a second full re-ingest: the
+  md5s are identical. `migrate` and `load-configs` are also safe to re-run.
+- **Tests**: `go test ./...` covers money parsing (including the
+  thousands-separator rows), the GMT→UTC timestamp conversion, key
+  normalization, `record_ref` templating, the config-matching precedence
+  and ambiguity handling, and the dual-sign Summary lines.
 - **Performance**: ingesting both files (23,026 payment rows exploded to
   308,266 total components + 54,980 settlement rows, matched against 281
   config rules, bulk-loaded via `COPY`, with the summary accumulator
-  flushed every 5,000 rows) takes ~40-45 seconds; `report` generation
-  takes ~5 seconds; the full `all` sequence (schema + configs + ingest +
-  report, from a cold database) completes in under a minute on a
+  flushed every 5,000 rows) takes roughly 45-70 seconds; `report`
+  generation takes about 5-10 seconds; the full `all` sequence (schema +
+  configs + ingest + report, from a cold database) takes roughly 1-4 minutes on a
   laptop-class container. `ingest-data` runs an explicit `ANALYZE` +
   `CHECKPOINT` right after the bulk load — without it, the report's
   join-heavy query ran immediately after a large `COPY` competed with

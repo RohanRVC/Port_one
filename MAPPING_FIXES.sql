@@ -66,10 +66,12 @@ WHERE source_line = 65
 -- before this fix, "Other" (Sales) showed Payments=$0.00 /
 -- Settlements=$11.97, while the missing money sat in the now-defunct
 -- sales_gift_wrap_credits bucket at $11.61 for the same reconciled
--- record_refs (the ~$0.36 gap between $11.97 and $11.61 is the
--- GiftWrapTax sub-component, which settlement tracks as a separate line
--- that also needs to land here -- already covered since both GiftWrap and
--- GiftWrapTax settlement rules route to sales_other).
+-- record_refs. After the fix the gift-wrap principal agrees exactly:
+-- payment gift_wrap_credits $11.61 = settlement ItemPrice/GiftWrap $11.61
+-- (3 records each). The remaining $0.36 on that line is settlement's
+-- ItemPrice/GiftWrapTax, which the Payments report doesn't carry as its
+-- own column at all -- it's inside the combined "sales tax collected"
+-- figure. That belongs to the tax re-bucketing described under FIX 5.
 UPDATE payment_mapping_configs
 SET summary_field_positive = 'sales_other',
     summary_field_negative = 'sales_other'
@@ -160,8 +162,9 @@ WHERE source_line = 110
 
 -- =====================================================================
 -- FIX 5 — duplicate/ambiguous config key: ORDER + sales_tax_collected
--- Impact: removes non-deterministic behavior; ~$103.78 / -$103.42 residual
--- explained but NOT closed by this fix alone (see note below)
+-- Impact: removes non-deterministic behavior; no dollar change. The
+-- +$103.78 / -$103.42 / -$0.36 line-level residual is fully explained
+-- (nets to $0.00) but not closed by this fix -- see note below.
 -- =====================================================================
 -- What it was: payment config lines 71 and 72 both key on the identical
 -- tuple (ORDER, any, sales_tax_collected) but route to different buckets:
@@ -181,19 +184,24 @@ WHERE source_line = 110
 -- matches what our matcher was already deterministically choosing, so this
 -- fix changes no dollar figures in this run -- it only removes the
 -- undefined, line-order-dependent behavior and makes the intent explicit.
--- What this does NOT fully close: Amazon's Payments report gives us ONE
--- combined "sales tax collected" number per order line; the Settlement
--- report sometimes splits the economically equivalent tax into a
--- product-price portion and a shipping portion (LowValueGoodsTax-Principal
--- vs -Shipping, both routed differently). Proportionally splitting a single
--- payments column across two summary buckets isn't expressible in this
--- config schema -- it only supports one flat (transaction_type,
--- description, amount_field) -> bucket mapping, not a conditional or
--- percentage split. This is the same underlying limitation as FIX 6
--- below, and together they leave a small (~$0.36 net, ~$103 gross,
--- <0.05% of either line) residual between "Product Charges" and
--- "Shipping" that we consider a genuine, documented, schema-level
--- limitation rather than an unresolved mapping defect. See PROGRESS.md.
+-- What this does NOT close, and exactly what it is: the Payments report
+-- has ONE combined "sales tax collected" column; the Settlement report
+-- splits the same tax into several lines that its config deliberately
+-- buckets differently (ItemPrice/Tax -> Product Charges, ItemPrice/
+-- ShippingTax and Promotion/TaxDiscount -> Shipping, ItemPrice/GiftWrapTax
+-- -> Other). Measured on the 13,289 reconciled record_refs, at the
+-- component level:
+--   payment sales_tax_collected                       13,675.59
+--   settlement Tax 13,765.71 + ShippingTax 581.68
+--     + TaxDiscount -672.16 + GiftWrapTax 0.36        13,675.59   (to the cent)
+-- so the money itself agrees exactly; only its bucket differs. The
+-- resulting line-level differences (Product Charges +103.78, Shipping
+-- -103.42, Other -0.36) net to exactly $0.00, i.e. the Sales section
+-- subtotal ties to the cent on reconciled records. One flat
+-- (transaction_type, description, amount_field) -> bucket rule can't split
+-- one payments column across four buckets, and we chose not to re-bucket
+-- the settlement side's deliberate tax classification just to force the
+-- lines to match. Same limitation covers FIX 6 (low_value_goods).
 DELETE FROM payment_mapping_configs
 WHERE source_line = 72
   AND transaction_type = 'ORDER' AND amount_field = 'sales_tax_collected'
@@ -396,6 +404,39 @@ SET summary_field_positive = 'sales_inventory_reimbursements',
 WHERE source_line = 31
   AND transaction_type = 'ADJUSTMENT'
   AND description = 'FBA_INVENTORY_REIMBURSEMENT_-_FEE_CORRECTION';
+
+
+-- =====================================================================
+-- FIX 13 — tax on refunds is dropped from the summary on the payment side
+-- Impact measured in this dataset: $42.59 on reconciled records (exact),
+-- $71.06 in total (-42.59 reconciled, -28.47 on payment-only refunds)
+-- =====================================================================
+-- What it was: payment config line 14 (REFUND / any / sales_tax_collected)
+-- has EMPTY routing for both signs, so tax refunded to customers never
+-- reaches the Summary sheet from the Payments report. The settlement side
+-- routes every equivalent refund tax line to `refunded_expenses`
+-- (REFUND/ItemPrice/Tax line 4, /ShippingTax line 11, /GiftWrapTax line
+-- 12, Promotion/TaxDiscount line 20). For ORDER rows the payment config
+-- does summarize sales_tax_collected (lines 71/72), so the tax on a sale
+-- was counted but the tax on its refund was not.
+-- How it was found: after every other fix, the only bucket still
+-- disagreeing by an amount NOT explained by re-bucketing was
+-- refunded_expenses, +$42.59 across 16 reconciled refund record_refs.
+-- Component by component, payment fba_fees 28.89 = settlement
+-- ShippingChargeback 28.89 and payment selling_fees 117.36 = settlement
+-- Commission + RefundCommission 117.36 (both exact); the leftover was
+-- settlement Tax -41.09, ShippingTax -3.19, TaxDiscount +1.69 = -42.59,
+-- and the payment side's unrouted REFUND sales_tax_collected on those
+-- same 16 record_refs is exactly -42.59.
+-- What we changed it to: refunded_expenses, both signs, the bucket the
+-- settlement side uses for the same money. Refund low_value_goods (line 4)
+-- and marketplace_withheld_tax (line 13) are also empty-routed, but have
+-- no nonzero refund rows in this data (checked), so we left them alone.
+UPDATE payment_mapping_configs
+SET summary_field_positive = 'refunded_expenses',
+    summary_field_negative = 'refunded_expenses'
+WHERE source_line = 14
+  AND transaction_type = 'REFUND' AND amount_field = 'sales_tax_collected';
 
 
 -- =====================================================================

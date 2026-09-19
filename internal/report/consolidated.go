@@ -15,6 +15,7 @@ var consolidatedHeaders = []string{
 	"sku", "order_id", "settlement_id", "date",
 	"payment_amount", "settlement_amount", "difference",
 	"payment_row_count", "settlement_row_count",
+	"payment: transaction_status",
 }
 
 type consolidatedRow struct {
@@ -26,6 +27,7 @@ type consolidatedRow struct {
 	date                                  *time.Time
 	paymentAmount, settlementAmount, diff float64
 	paymentRowCount, settlementRowCount   int
+	payStatus                             *string
 }
 
 // FetchConsolidatedRows joins reconciliation_results back to one
@@ -41,7 +43,8 @@ func FetchConsolidatedRows(ctx context.Context, pool *pgxpool.Pool) ([]consolida
 			p.transaction_type, p.description, p.amount_field, p.summary_field,
 			s.transaction_type, s.amount_type, s.amount_description, s.summary_field,
 			COALESCE(p.sku, s.sku), COALESCE(p.order_id, s.order_id), COALESCE(p.settlement_id, s.settlement_id),
-			COALESCE(p.txn_date, s.txn_date)
+			COALESCE(p.txn_date, s.txn_date),
+				p.raw_payload->>'Transaction status'
 		FROM reconciliation_results rr
 		LEFT JOIN LATERAL (
 			-- Prefer a component that actually routed to a summary bucket over one
@@ -71,7 +74,7 @@ func FetchConsolidatedRows(ctx context.Context, pool *pgxpool.Pool) ([]consolida
 			&r.paymentRowCount, &r.settlementRowCount,
 			&r.payTT, &r.payDesc, &r.payField, &r.paySummary,
 			&r.setTT, &r.setType, &r.setDesc, &r.setSummary,
-			&r.sku, &r.orderID, &r.settlementID, &r.date,
+			&r.sku, &r.orderID, &r.settlementID, &r.date, &r.payStatus,
 		); err != nil {
 			return nil, err
 		}
@@ -116,6 +119,7 @@ func WriteConsolidatedSheet(f *excelize.File, rows []consolidatedRow) error {
 			deref(r.sku), deref(r.orderID), deref(r.settlementID), dateStr(r.date),
 			r.paymentAmount, r.settlementAmount, r.diff,
 			r.paymentRowCount, r.settlementRowCount,
+			deref(r.payStatus),
 		}
 		for c, v := range vals {
 			cell, _ := excelize.CoordinatesToCellName(c+1, row)

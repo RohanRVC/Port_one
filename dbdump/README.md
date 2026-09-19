@@ -13,12 +13,13 @@ a submission, so this directory has:
   (empty after the fixes — see PROGRESS.md).
 - `04_reconciliation_results_data.sql` — **full** data for
   `reconciliation_results` (22,666 rows: one per distinct `record_ref`).
-- `05_raw_records_representative_sample.csv` — a ~1,900-row sample of
-  `raw_records`: every row involved in the two biggest findings (the two
-  `Transfer` rows, all nonzero `gift_wrap_credits` rows), every row that
-  triggered a config-matching ambiguity in the *before-fix* run, plus a
-  ~0.7% random sample across the rest of the table for general
-  representativeness.
+- `05_raw_records_representative_sample.csv` — a ~2,200-row sample of
+  `raw_records` (post-fix state): every row behind three of the findings
+  (the two `Transfer` rows, all nonzero `gift_wrap_credits` rows, all
+  nonzero refund `sales_tax_collected` rows), plus a ~0.7% random sample
+  across the rest of the table for general representativeness. (The
+  ambiguous-match rows only exist in the before-fix run; after the fixes
+  there are none.)
 
 To restore into a fresh database:
 ```

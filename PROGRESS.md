@@ -179,13 +179,16 @@ SELECT min(txn_date), max(txn_date) FROM raw_records WHERE source_type='payment'
 -- 2026-06-30 to 2026-07-31
 ```
 
-This settlement file covers exactly **one** settlement period (single
-`settlement-id`), a 15-day window. The payments file spans a wider range
-that overlaps but extends earlier. Every settlement-side dollar in this
-file has a payment-side counterpart somewhere in the wider payments window
-— unsurprising once you see it's one settlement drawing from a superset of
-orders we do have visibility into, rather than evidence of a matching bug.
-Ruled out as "not a bug" on this basis, not assumed.
+This settlement file covers exactly **one** settlement (single
+`settlement-id`, 12395580393), a 15-day window. The payments file spans a
+wider range. Later (step 6) I found the payments file references **four**
+settlement IDs (12370691583, 12382593803, 12395580393, 12407469483), so
+the settlement side is a subset of what the payments file covers, which is
+why every settlement-side dollar has a payment-side counterpart and not the
+other way round. Ruled out as "not a bug" on that basis. The zero is also
+consistent with the independent checks: the settlement lines sum to
+212,118.95, exactly the `total-amount` the file declares for that
+settlement.
 
 ## 6. Why are there 9,379 unreconciled-payment record_refs?
 
@@ -211,14 +214,31 @@ EXISTS(SELECT 1 FROM raw_records x WHERE x.source_type='settlement' AND x.order_
 
 The order_id genuinely does not appear anywhere in the settlement file —
 not under a different date, not under a different SKU pairing. Two of the
-eight had no `Transaction Release Date` at all (order not yet released).
-Conclusion: these orders belong to settlement periods we were not given
-data for (this dataset gives us one settlement out of presumably many the
-seller has had) — a data-coverage gap, not a mapping defect. This also
-explains why the Summary sheet's Sales/Product Charges line shows such a
-large Payments-vs-Settlements gap even *before* any fix (see step 8): most
-of that gap is coverage, and no config change can close it. Restated
-explicitly in the README rather than left implicit.
+eight had no `Transaction Release Date` at all. My first conclusion from
+that sample was "these orders belong to settlements we weren't given". That
+turned out to be only part of it, so I checked the whole population instead
+of extrapolating from 8 rows (this was done late, during final
+verification, after the fixes):
+
+```sql
+-- every unreconciled_payment record_ref, classified
+A  payment row is Released, settlement id is one we were not given        6,876 refs  123,953.39
+B  payment row is Deferred (no release date), any settlement id           2,501 refs   45,813.08
+   (2,373 carry our settlement id, 125 another, 3 are a deferred line of
+    an order whose other line item did reconcile)
+                                                                         -----       ----------
+                                                                          9,377       169,766.47
+```
+
+Two causes, no residue, and the total matches the unreconciled sum to the
+cent. Both are properties of the input files (which settlements we were
+handed; which transactions Amazon has released yet), not mapping defects,
+and no config change can close them. The payments file's own preamble says
+post-2025 reports "include both released and deferred transactions", which
+is what B is. This is also why the Summary's Product Charges line shows
+such a large Payments-vs-Settlements gap even before any fix. The
+Consolidated sheet now carries the payment side's `transaction_status`
+so the reason is visible row by row.
 
 ## 7. The single biggest defect: $231,676.27 in the wrong bucket
 
@@ -294,9 +314,12 @@ precision: `sales_other` had **$0 on the payment side, $11.97 on the
 settlement side**, while a separate line, `sales_gift_wrap_credits`,
 showed **$11.61 on the payment side** for the same reconciled record_refs —
 confirming payment's gift-wrap money was sitting in the orphan bucket
-instead of `sales_other`. Fixed as FIX 2 (the remaining $0.36 gap is the
-`GiftWrapTax` settlement sub-component, which routes to `sales_other` too
-and is now captured now that both sides land on the same bucket).
+instead of `sales_other`. Fixed as FIX 2. After the fix the gift-wrap
+principal agrees exactly (11.61 both sides); the leftover $0.36 on that
+line is settlement's `GiftWrapTax`, which I first mis-explained here as
+part of the gift-wrap fix. It isn't: the payments report has no gift-wrap-tax
+column, that money is inside the combined `sales tax collected` figure,
+and it belongs to the tax re-bucketing in step 9.
 
 ## 9. The two duplicate-key defects: what actually changes, what doesn't
 
@@ -315,88 +338,125 @@ the equivalent tax 50/50 by *count* but ~71:1 by *dollar value*
 clearly-correct single bucket to collapse into, so we left the existing
 behavior in place rather than switch it on a coin flip. Documented in
 `MAPPING_FIXES.sql` FIX 5/FIX 6 as removing undefined behavior, not as
-closing the ~$103/$0.36 residual between Product Charges and Shipping —
-that residual is a genuine schema limitation (see README), confirmed by
-checking that after the fix, `sales_product_charges`/`sales_shipping`'s
-reconciled-only totals moved by $0.00 (as expected, since the fix codified
-existing behavior rather than changing it).
+closing the +103.78 / -103.42 / -0.36 residual on Product Charges /
+Shipping / Other. Confirmed: deleting the two duplicate rows leaves the
+Product Charges and Shipping reconciled-only totals exactly as they were
+(349,012.55 and 8,097.54 on the payment side), since the fix codified
+existing behavior.
+
+That residual is *not* an unexplained gap, and I was too quick to file it
+under "schema limitation" the first time. Broken down by component on the
+13,289 reconciled record_refs:
+
+```
+                                  payment      settlement
+product_sales / ItemPrice.Principal  335,336.96  335,336.96   exact
+shipping_credits / ItemPrice.Shipping  8,294.16    8,294.16   exact
+gift_wrap_credits / ItemPrice.GiftWrap    11.61       11.61   exact
+sales_tax_collected (one column)      13,675.59
+  vs settlement Tax 13,765.71 + ShippingTax 581.68
+     + Promotion/TaxDiscount -672.16 + GiftWrapTax 0.36 =      13,675.59   exact
+low_value_goods (one column)            -196.62
+  vs settlement LVG-Principal -193.90 + LVG-Shipping -2.72 =    -196.62   exact
+```
+
+Every component agrees to the cent; the payments file simply has one
+combined tax column and one combined low-value-goods column, while the
+settlement config sends its finer tax lines to Product Charges, Shipping
+and Other. So the three lines move against each other and net to exactly
+0.00, and the Sales subtotal on reconciled records ties. I did not
+re-bucket the settlement side to force the lines to match: that would
+override a deliberate classification to make a number agree, which is
+exactly the "plug" the brief warns against.
 
 ## 10. Chasing the last $42.59
 
-Before any fixes, the *entire* dataset's reconciled-side gap (summed across
-every bucket) was exactly $42.59 — small enough to be worth fully
-accounting for rather than writing off. Broke it down bucket by bucket
-(same reconciled-only query as step 8) and found it resolves into three
-independent pieces:
+Before any fixes, the reconciled-side gap (payment sum minus settlement sum
+over the 13,289 reconciled record_refs: 212,161.54 vs 212,118.95) was
+exactly $42.59, small enough to be worth accounting for fully. Bucket by
+bucket, same reconciled-only query as step 8:
 
-- `expenses_other` / `expenses_promotional_rebates`: -$11,273.53 / +$11,273.53 — nets to $0 (this is defect #2, step 8).
-- `sales_other` / `sales_gift_wrap_credits`: -$11.97 / +$11.61 → nets to -$0.36 (defect #3, step 8, minus the small GiftWrapTax residual).
-- `sales_product_charges` / `sales_shipping`: +$103.78 / -$103.42 → nets to +$0.36 (the duplicate-key/granularity residual, step 9).
-- `refunded_expenses`: +$42.59, standalone.
+- `expenses_other` / `expenses_promotional_rebates`: -$11,273.53 / +$11,273.53, nets to $0 (step 8).
+- `sales_other` / `sales_gift_wrap_credits`: -$11.97 / +$11.61.
+- `sales_product_charges` / `sales_shipping`: +$103.78 / -$103.42.
+- `refunded_expenses`: +$42.59, on its own.
 
-The first three net to exactly $0.00 (the two $0.36 residuals are equal and
-opposite). The remaining $42.59 is entirely `refunded_expenses`. Traced its
-contributing rows directly:
+The first three net to $0.00 (the -0.36 and +0.36 cancel). The $42.59 is
+entirely `refunded_expenses`.
 
-```sql
-SELECT p.amount_field, count(*), sum(p.amount)
-FROM raw_records p
-WHERE p.source_type='payment' AND p.summary_field='refunded_expenses'
-  AND NOT EXISTS (SELECT 1 FROM raw_records s WHERE s.source_type='settlement'
-                  AND s.record_ref = p.record_ref AND s.summary_field='refunded_expenses')
-GROUP BY 1;
+**My first explanation of that $42.59 was wrong.** I looked at payment-side
+`refunded_expenses` rows with no settlement `refunded_expenses` row under
+the same record_ref, got 155.39 + 97.84 + 14.66 = 267.89, and wrote it up as
+small refund-fee reversals posting a few days late plus a "$14.66 FBA-fee
+refund config gap". That query spanned payment-only refunds across the whole
+file, not the reconciled records where the 42.59 actually lives, so it
+explained a different number. I caught it in the final verification pass
+by asking what is *inside* the 42.59:
+
 ```
-```
-promotional_rebates | 43 | 155.39
-selling_fees         | 30 |  97.84
-fba_fees             |  4 |  14.66
+refunded_expenses inside reconciled refs, by source column / settlement line
+payment    fba_fees             28.89    settlement ItemFees/ShippingChargeback     28.89   exact
+payment    selling_fees        117.36    settlement Commission + RefundCommission  117.36   exact
+payment    promotional_rebates 112.62    settlement Promotion/Principal + /Shipping 112.62  exact
+                                         settlement ItemPrice/Tax                  -41.09
+                                         settlement ItemPrice/ShippingTax           -3.19
+                                         settlement Promotion/TaxDiscount           +1.69
+                                                                                   ------
+                                                                                   -42.59
 ```
 
-Spread across 3 different amount fields on many different orders, each a
-small individual refund-fee reversal with no exact-matching settlement
-counterpart under the same `record_ref` — consistent with the same
-settlement-timing-boundary effect documented in step 6 (a refund's fee
-reversal posting a few days later than the refund itself, sometimes
-crossing this settlement window's edge), just at much smaller scale. The
-`fba_fees` sub-piece (4 records, $14.66) is additionally notable: the
-settlement config has no explicit `REFUND`/`ItemFees`/(FBA-fee-reversal)
-rule at all, unlike its `Commission`/`RefundCommission` siblings — a
-genuine, narrow config gap, but $14.66 is too small and too
-context-dependent (would need confirmation this combination ever appears
-in a real settlement export) to fix with confidence rather than guess.
-Documented, not force-fixed — this is the one variance in the whole
-investigation we're calling "accounted for but not closeable with the
-evidence available," per the assignment's own framing for exactly this
-situation.
+Everything pairs off exactly except settlement-side refund *tax* lines that
+total -42.59. The payments side has that money too: `REFUND` rows'
+`sales_tax_collected` on the same 16 record_refs sums to exactly -42.59, but
+payment config line 14 (`REFUND / any / sales_tax_collected`) has empty
+routing, so tax refunded to customers never reaches the Summary from the
+Payments report, while the settlement config counts it in
+`refunded_expenses`. Same kind of defect as the promotional rebates one (the
+same money bucketed differently on the two sides), and easy to miss by eye
+because the row looks like the other intentionally-empty ones.
+
+Fixed as `MAPPING_FIXES.sql` FIX 13 (route it to `refunded_expenses`). After
+it, `refunded_expenses` agrees to the cent on reconciled records, and the
+13,289 reconciled record_refs total 212,118.95 on both sides with none of
+them carrying a nonzero difference. The Payments column moves by -71.06 in
+total (-42.59 reconciled, -28.47 on payment-only refunds). The earlier
+"$14.66 FBA-fee refund gap" does not exist: payment `fba_fees` 28.89 equals
+settlement ShippingChargeback 28.89 exactly.
 
 ## 11. Applying the fixes and confirming the after-fix numbers
 
-Applied all 12 fixes in `MAPPING_FIXES.sql` directly against the live
-config tables, then re-ran `ingest-data` (which reuses the now-fixed config
-tables — it does not reload from CSV) and regenerated the report.
+Applied all 13 fixes in `MAPPING_FIXES.sql` to the live config tables (with
+the exact command from the README), then re-ran `ingest-data` (which reuses
+the now-fixed config tables, it does not reload from CSV) and regenerated
+the report.
 
 ```
-before: payments ... 252456 matched (45566 ambiguous rows) ...
-after:  payments ... 252456 matched (0 ambiguous rows) ...
+before: payments ... 252456 matched (45566 ambiguous rows) ...   reconciliation: 13289 / 9379 / 0
+after:  payments ... 252456 matched (0 ambiguous rows) ...       reconciliation: 13289 / 9377 / 0
 ```
 
-Every predicted change matched exactly:
+Read straight from the two committed workbooks (Payments / Settlements):
 
-| Summary line | Before (Pay / Settle) | After (Pay / Settle) | Change |
+| Summary line | Before | After | What changed |
 |---|---|---|---|
-| Sales / Other | 0.00 / 11.97 | 33.19 / 11.97 | +33.19 (= $11.61 reconciled + $21.58 unreconciled gift-wrap money, now visible) |
-| Expenses / Promo rebates | 0.00 / -11273.53 | -25108.38 / -11273.53 | payment side now shows this bucket's real activity at all |
-| Expenses / Other | -25108.38 / 0.00 | 0.00 / 0.00 | the promo-rebates money that used to sit here moved out entirely |
-| Expenses / Amazon fees | -449312.42 / -132593.41 | -217636.15 / -132593.41 | improved by exactly $231,676.27 |
-| Expenses (section) | -476066.38 / -143867.35 | -244390.11 / -143867.35 | improved by exactly $231,676.27 |
+| Sales / Other | 0.00 / 11.97 | 33.19 / 11.97 | gift-wrap credits now visible (11.61 reconciled + 21.58 payment-only) |
+| Refunds (section) | -3,373.85 / -1,815.09 | -3,444.91 / -1,815.09 | FIX 13 |
+| Refunds / Refund expenses | 526.76 / 216.28 | 455.70 / 216.28 | FIX 13: -71.06 |
+| Expenses / Promo rebates | 0.00 / -11,273.53 | -25,108.38 / -11,273.53 | payment side now lands in the right line |
+| Expenses / Other | -25,108.38 / 0.00 | 0.00 / 0.00 | that money moved out |
+| Expenses / Amazon fees | -449,312.42 / -132,593.41 | -217,636.15 / -132,593.41 | +231,676.27 (Transfer rows out) |
+| Expenses (section) | -476,066.38 / -143,867.35 | -244,390.11 / -143,867.35 | +231,676.27 |
 
-Settlement-side totals are **byte-identical** before and after (as
-expected — only one settlement config row was touched, for a rule with
-$0 measured impact in this run). Config-matching ambiguities: 2 → 0.
-Reconciled/unreconciled counts moved by exactly 2 (9,379 → 9,377
-unreconciled-payment — the two Transfer rows, now correctly excluded from
-`unreconciled_payment`'s dollar total instead of being miscounted there via
-the fallback bug).
+The Settlements column is unchanged (only one settlement config row was
+touched, and its positive branch never occurs in this data). Ambiguities:
+2 -> 0. Unreconciled-payment 9,379 -> 9,377: the two Transfer rows, which
+used to be counted as summarizable payment-only money via the fallback rule
+and now correctly aren't.
+
+On the reconciled records: before, payment 212,161.54 vs settlement
+212,118.95 (diff 42.59, all of it in 16 refund record_refs). After, both
+sides 212,118.95, and 0 of the 13,289 reconciled record_refs has a nonzero
+difference.
 
 ## 11b. A pipeline bug that had nothing to do with the data
 
@@ -422,22 +482,51 @@ regardless) and running an explicit `ANALYZE` + `CHECKPOINT` at the end of
 `ingest-data`, so `report` never has to race Postgres's own background
 checkpoint I/O. Confirmed with a full clean `docker compose down -v` →
 `all` → apply fixes → `ingest-data` → `report` cycle afterward: consistently
-under a minute end to end, both before and after the mapping fixes.
+roughly a minute or two end to end (up to four on a busy machine), both before and after the mapping fixes.
 
-## 12. What's left unclosed, and why
+## 12. What's left, and why
 
-Every remaining Payments-vs-Settlements gap on every Summary line, after
-all 12 fixes, is one of exactly three things, each traced to a specific,
-checkable cause rather than left as an unexplained residual:
+After 13 fixes, the Payments and Settlements columns of the Summary sheet
+still differ. Every remaining difference is one of two things, both traced
+to a specific, checkable cause:
 
-1. **Settlement-period coverage** (step 5/6) — the large majority of every
-   remaining gap. Not fixable via config; it's a property of which files we
-   were given, not a mapping defect.
-2. **The Product Charges/Shipping schema-granularity limit** (step 9) —
-   ~$103 gross / $0.36 net, not expressible in the current config schema.
-3. **The $14.66 FBA-fee-refund config gap** (step 10) — real but too small
-   and too uncertain to fix without guessing at intent.
+1. **The 9,377 payment-only record_refs (169,766.47).** Checked across all of
+   them (step 6): 6,876 are Released transactions belonging to three
+   settlements that are not in the settlement file, and 2,501 are Deferred
+   transactions with no release date. Properties of the input files, not
+   mapping defects, so no config change can close them. The Consolidated
+   sheet shows `transaction_status` and `settlement_id` per row so a
+   reviewer can see which is which.
+2. **Tax bucketing on the Sales lines: +103.78 / -103.42 / -0.36, net
+   0.00** (step 9). Same money, different bucket, exact at the component
+   level. Left as is on purpose; documented in FIX 5/6.
 
-Nothing was hardcoded or pattern-matched to force a specific total; every
-fix in `MAPPING_FIXES.sql` is traceable to a specific config row and a
-specific, measured (or explicitly zero) dollar effect.
+Nothing was hardcoded or pattern-matched to force a total; every fix in
+`MAPPING_FIXES.sql` is traceable to a specific config row and a measured
+(or explicitly zero) dollar effect. The remaining defects in that file
+(shipment id vs order id, PROMOTION_FEE, the malformed `record_type` row,
+and so on) don't occur in this data, so they are documented but have no
+effect on these numbers.
+
+## 13. Final verification pass, and what it corrected
+
+Before writing the submission email I re-checked everything from scratch
+rather than trusting the notes above. That found real problems in my own
+write-up, all now corrected:
+
+- The $42.59 was mis-explained (step 10) and hid a 13th config defect.
+- The "unreconciled = other settlement periods" explanation was based on an
+  8-row sample and was incomplete (step 6): there are two causes, and the
+  Deferred one (2,501 refs) had been folded into the wrong story.
+- The README claimed the reconciled lines "agree to the cent". Not true at
+  the bucket level (the three tax lines), true at the record_ref level.
+- The README's step 4 referenced a service that doesn't exist.
+- "Byte-identical re-ingest" was stronger than what I had measured; it is
+  now the md5 of all three derived tables before and after a second
+  re-ingest.
+
+What was added: unit tests, an independent Python re-implementation (zero
+mismatches on 19 buckets and 22,666 record_refs), and the tie-outs listed
+under "How the numbers were checked" in the README (the settlement total
+Amazon declares, the payments `total` checksum, the per-type accounting of
+every payments dollar).
