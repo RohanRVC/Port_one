@@ -40,8 +40,9 @@ investigation of the mapping defects planted in the given configs (see
 - Biggest single fix: a mis-keyed `TRANSFER` rule was dumping **$231,676.27**
   of unrelated bank-transfer money into the "Amazon fees" Summary line.
   Then **$11,273.53** of promotional rebates bucketed as generic "Other"
-  instead of "Promo rebates"; **$42.59** of tax on refunds that never
-  reached the Refunds section; and gift-wrap-credit money that was
+  instead of "Promo rebates"; **$71.06** of tax on refunds ($42.59 of it
+  on reconciled records) that never reached the Refunds section; and
+  gift-wrap-credit money that was
   invisible on the Summary sheet entirely (routed to a bucket the template
   has no line for).
 - Two duplicate config keys that made matching ambiguous on 45,566 rows are
